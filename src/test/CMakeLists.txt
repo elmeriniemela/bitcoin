@@ -76,6 +76,8 @@ add_executable(test_bitcoin
   pool_tests.cpp
   pow_tests.cpp
   prevector_tests.cpp
+  quantum_commit_tests.cpp
+  quantum_commitdb_tests.cpp
   raii_event_tests.cpp
   random_tests.cpp
   rbf_tests.cpp

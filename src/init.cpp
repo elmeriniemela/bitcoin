@@ -73,6 +73,7 @@
 #include <torcontrol.h>
 #include <txdb.h>
 #include <txmempool.h>
+#include <quantum_commitdb.h>
 #include <util/asmap.h>
 #include <util/batchpriority.h>
 #include <util/chaintype.h>
@@ -340,6 +341,13 @@ void Shutdown(NodeContext& node)
         if (node.validation_signals) {
             node.validation_signals->UnregisterValidationInterface(node.fee_estimator.get());
         }
+    }
+
+    // Flush quantum commitment database before chainstate
+    if (g_quantum_commitdb) {
+        LogInfo("Flushing quantum commitment database...");
+        g_quantum_commitdb->Flush();
+        g_quantum_commitdb.reset();
     }
 
     // FlushStateToDisk generates a ChainStateFlushed callback, which we should avoid missing
@@ -1319,6 +1327,19 @@ static ChainstateLoadResult InitAndLoadChainstate(
         },
     };
     Assert(ApplyArgsManOptions(args, blockman_opts)); // no error can happen, already checked in AppInitParameterInteraction
+
+    // Initialize quantum commitment database before chainstate manager
+    LogInfo("Opening quantum commitment database...");
+    size_t nQuantumCacheSize = std::min<size_t>(cache_sizes.coins / 10, 10 << 20); // 10% of coin cache, max 10MB
+    try {
+        g_quantum_commitdb = std::make_unique<CQuantumCommitmentDB>(
+            nQuantumCacheSize,
+            false,  // fMemory = false (use disk)
+            do_reindex || do_reindex_chainstate  // fWipe on reindex
+        );
+    } catch (const std::exception& e) {
+        return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated(strprintf("Error initializing quantum commitment database: %s", e.what()))};
+    }
 
     // Creating the chainstate manager internally creates a BlockManager, opens
     // the blocks tree db, and wipes existing block files in case of a reindex.

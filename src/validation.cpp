@@ -40,6 +40,9 @@
 #include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <quantum_commit.h>
+#include <quantum_commitdb.h>
+#include <quantum_validation.h>
 #include <random.h>
 #include <script/script.h>
 #include <script/sigcache.h>
@@ -2547,6 +2550,14 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
     CBlockUndo blockundo;
 
+    // Process quantum commitments and detect PoQC before transaction validation
+    // This ensures commitments are available when validating transactions
+    if (!ProcessQuantumCommitments(block, pindex, view)) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                           "bad-quantum-commitment-processing",
+                           "Failed to process quantum commitments in block");
+    }
+
     // Precomputed transaction data pointers must not be invalidated
     // until after `control` has run the script checks (potentially
     // in multiple threads). Preallocate the vector size so a new allocation
@@ -2631,6 +2642,44 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                               tx_state.GetRejectReason(), tx_state.GetDebugMessage());
                 break;
+            }
+
+            // Verify quantum commitment if PoQC has been activated
+            if (g_quantum_commitdb && g_quantum_commitdb->IsPoQCActivated()) {
+                auto pubkey_opt = ExtractPubKeyFromTx(tx, view);
+
+                if (!pubkey_opt) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                "bad-quantum-no-pubkey",
+                                strprintf("Transaction %s does not reveal a public key (required after PoQC activation)",
+                                        tx.GetHash().ToString()));
+                    break;
+                }
+
+                const CPubKey& pubkey = pubkey_opt.value();
+                uint256 aid_hash = QuantumCommitmentHashAID(pubkey);
+                std::vector<unsigned char> aid = TruncateHash(aid_hash, QUANTUM_COMMITMENT_AID_SIZE);
+
+                auto ctxid_opt = g_quantum_commitdb->FinalizeAID(aid, pubkey, tx);
+
+                if (!ctxid_opt) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                "bad-quantum-no-commitment",
+                                strprintf("Transaction %s requires quantum commitment (PoQC activated at height %d)",
+                                        tx.GetHash().ToString(),
+                                        g_quantum_commitdb->GetPoQCActivationHeight()));
+                    break;
+                }
+
+                const uint256& txid = tx.GetHash().ToUint256();
+                std::vector<unsigned char> tx_ctxid = TruncateHash(txid, QUANTUM_COMMITMENT_CTXID_SIZE);
+
+                if (tx_ctxid != ctxid_opt.value()) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                "bad-quantum-commitment-mismatch",
+                                strprintf("Transaction %s does not match quantum commitment", tx.GetHash().ToString()));
+                    break;
+                }
             }
         }
 

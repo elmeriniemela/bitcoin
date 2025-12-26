@@ -244,6 +244,9 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   policy/rbf.cpp
   policy/settings.cpp
   policy/truc_policy.cpp
+  quantum_commit.cpp
+  quantum_commitdb.cpp
+  quantum_validation.cpp
   rest.cpp
   rpc/blockchain.cpp
   rpc/external_signer.cpp
@@ -253,6 +256,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   rpc/net.cpp
   rpc/node.cpp
   rpc/output_script.cpp
+  rpc/quantum.cpp
   rpc/rawtransaction.cpp
   rpc/server.cpp
   rpc/server_util.cpp
