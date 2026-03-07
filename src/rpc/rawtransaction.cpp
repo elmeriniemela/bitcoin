@@ -406,6 +406,53 @@ static RPCHelpMan createrawtransaction()
     };
 }
 
+static RPCHelpMan commitrawtransaction()
+{
+    return RPCHelpMan{"commitrawtransaction",
+                "Commits to a transaction and returns the hex-encoded raw commitment transaction.",
+                {
+                    {"hexstring", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The transaction hex string"},
+                    {"iswitness", RPCArg::Type::BOOL, RPCArg::DefaultHint{"depends on heuristic tests"}, "Whether the transaction hex is a serialized witness transaction.\n"
+                        "If iswitness is not present, heuristic tests will be used in decoding.\n"
+                        "If true, only witness deserialization will be tried.\n"
+                        "If false, only non-witness deserialization will be tried.\n"
+                        "This boolean should reflect whether the transaction has inputs\n"
+                        "(e.g. fully valid, or on-chain transactions), if known by the caller."
+                    },
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    DecodeTxDoc(/*txid_field_doc=*/"The transaction id", /*wallet=*/false),
+                },
+                RPCExamples{
+                    HelpExampleCli("commitrawtransaction", "\"hexstring\"")
+            + HelpExampleRpc("commitrawtransaction", "\"hexstring\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    CMutableTransaction mtx;
+
+    bool try_witness = request.params[1].isNull() ? true : request.params[1].get_bool();
+    bool try_no_witness = request.params[1].isNull() ? true : !request.params[1].get_bool();
+
+    if (!DecodeHexTx(mtx, request.params[0].get_str(), try_no_witness, try_witness)) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed");
+    }
+
+    // CTransaction(std::move(mtx))
+
+    std::optional<bool> rbf;
+    if (!request.params[3].isNull()) {
+        rbf = request.params[3].get_bool();
+    }
+    CMutableTransaction rawTx; // TODO: create commitment transaction.
+
+    return EncodeHexTx(CTransaction(rawTx));
+
+},
+    };
+}
+
 static RPCHelpMan decoderawtransaction()
 {
     return RPCHelpMan{"decoderawtransaction",
