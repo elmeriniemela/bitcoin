@@ -19,7 +19,7 @@ rpcuser=elmeri
 
 ### Build
 * `rm -rf build`
-* `cmake -B build -DWITH_ZMQ=ON`
+* `cmake -B build -DWITH_ZMQ=ON -DCMAKE_BUILD_TYPE=Debug`
 * `cmake --build build 2> build/error.log`
 
 ### d commands:
