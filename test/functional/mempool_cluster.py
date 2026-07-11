@@ -86,6 +86,29 @@ class MempoolClusterTest(BitcoinTestFramework):
             assert_greater_than_or_equal(last_val['fee'] * x['weight'], x['fee'] * last_val['weight'])
             last_val = x
 
+    def check_diagram_matches_clusters(self, node):
+        """Check that the feerate diagram is consistent with the mempool contents.
+
+        The diagram must start at the origin, and its per-chunk (weight, fee)
+        deltas must be exactly the union of the chunks reported by
+        getmempoolcluster across all mempool clusters.
+        """
+        feeratediagram = node.getmempoolfeeratediagram()
+        assert_equal(feeratediagram[0], {"weight": 0, "fee": 0})
+        chunks = []
+        for prev, point in zip(feeratediagram, feeratediagram[1:]):
+            chunks.append((point["weight"] - prev["weight"], point["fee"] - prev["fee"]))
+
+        cluster_chunks = []
+        seen_txids = set()
+        for txid in node.getrawmempool():
+            if txid in seen_txids:
+                continue
+            for chunk in node.getmempoolcluster(txid)["chunks"]:
+                seen_txids.update(chunk["txs"])
+                cluster_chunks.append((chunk["chunkweight"], chunk["chunkfee"]))
+        assert_equal(sorted(chunks), sorted(cluster_chunks))
+
     def test_limit_enforcement(self, cluster_submitted, target_vsize_per_tx=None):
         """
         the cluster may change as a result of these transactions, so cluster_submitted is mutated accordingly
@@ -387,12 +410,113 @@ class MempoolClusterTest(BitcoinTestFramework):
         first_chunk_info = node.getmempoolcluster(first_chunk_tx["txid"])
         assert_equal(first_chunk_info, {'clusterweight': first_chunkweight + second_chunkweight + third_chunkweight, 'txcount': 3, 'chunks': [{'chunkfee': first_chunk_tx["fee"], 'chunkweight': first_chunkweight, 'txs': [first_chunk_tx["txid"]]}, {'chunkfee': second_chunk_tx["fee"] + 2*third_chunk_tx["fee"] + Decimal("0.00000001"), 'chunkweight': second_chunkweight + third_chunkweight, 'txs': [second_chunk_tx["txid"], third_chunk_tx["txid"]]}]})
 
+    @cleanup
+    def test_feerate_diagram(self):
+        node = self.nodes[0]
+
+        self.log.info("Testing getmempoolfeeratediagram")
+
+        def diagram_points():
+            return [(point["weight"], point["fee"]) for point in node.getmempoolfeeratediagram()]
+
+        # An empty mempool yields a diagram consisting of just the origin
+        assert_equal(node.getrawmempool(), [])
+        assert_equal(diagram_points(), [(0, 0)])
+
+        # A single transaction adds a single chunk
+        tx_mid = self.wallet.send_self_transfer(from_node=node, fee_rate=Decimal("0.0002"))
+        mid_weight = tx_mid["tx"].get_weight()
+        assert_equal(diagram_points(), [(0, 0), (mid_weight, tx_mid["fee"])])
+        self.check_diagram_matches_clusters(node)
+
+        # A lower-feerate transaction is appended after the existing chunk
+        parent_utxo = self.wallet.get_utxo(confirmed_only=True)
+        parent = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=parent_utxo, fee_rate=Decimal("0.00001"))
+        parent_weight = parent["tx"].get_weight()
+        assert_equal(diagram_points(), [
+            (0, 0),
+            (mid_weight, tx_mid["fee"]),
+            (mid_weight + parent_weight, tx_mid["fee"] + parent["fee"]),
+        ])
+        self.check_diagram_matches_clusters(node)
+
+        # CPFP: a high-feerate child is merged with its parent into a single
+        # chunk, which jumps ahead of the mid-feerate transaction
+        child = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=parent["new_utxo"], fee_rate=Decimal("0.001"))
+        cpfp_weight = parent_weight + child["tx"].get_weight()
+        cpfp_fee = parent["fee"] + child["fee"]
+        # sanity check: the CPFP chunk feerate exceeds tx_mid's feerate
+        assert_greater_than(cpfp_fee * mid_weight, tx_mid["fee"] * cpfp_weight)
+        assert_equal(diagram_points(), [
+            (0, 0),
+            (cpfp_weight, cpfp_fee),
+            (cpfp_weight + mid_weight, cpfp_fee + tx_mid["fee"]),
+        ])
+        self.check_diagram_matches_clusters(node)
+
+        # Prioritisation feeds into the diagram: bump tx_mid ahead of the CPFP chunk
+        priority_delta_sats = int(cpfp_fee * COIN)
+        node.prioritisetransaction(tx_mid["txid"], 0, priority_delta_sats)
+        assert_equal(diagram_points(), [
+            (0, 0),
+            (mid_weight, tx_mid["fee"] + cpfp_fee),
+            (mid_weight + cpfp_weight, tx_mid["fee"] + 2 * cpfp_fee),
+        ])
+        self.check_diagram_matches_clusters(node)
+
+        # Removing the prioritisation restores the previous diagram
+        node.prioritisetransaction(tx_mid["txid"], 0, -priority_delta_sats)
+        assert_equal(diagram_points(), [
+            (0, 0),
+            (cpfp_weight, cpfp_fee),
+            (cpfp_weight + mid_weight, cpfp_fee + tx_mid["fee"]),
+        ])
+
+        # RBF: replacing the parent evicts the whole CPFP chunk from the diagram
+        replacement = self.wallet.create_self_transfer(utxo_to_spend=parent_utxo, fee=2 * cpfp_fee)
+        node.sendrawtransaction(replacement["hex"])
+        assert parent["txid"] not in node.getrawmempool()
+        assert child["txid"] not in node.getrawmempool()
+        replacement_weight = replacement["tx"].get_weight()
+        assert_equal(diagram_points(), [
+            (0, 0),
+            (replacement_weight, 2 * cpfp_fee),
+            (replacement_weight + mid_weight, 2 * cpfp_fee + tx_mid["fee"]),
+        ])
+        self.check_diagram_matches_clusters(node)
+
+        # Package submission: a zero-fee parent sponsored by its child forms a
+        # single chunk whose fee is paid entirely by the child
+        zero_fee_parent = self.wallet.create_self_transfer(utxo_to_spend=self.wallet.get_utxo(confirmed_only=True), fee=0, fee_rate=0)
+        sponsor_child = self.wallet.create_self_transfer(utxo_to_spend=zero_fee_parent["new_utxo"], fee_rate=Decimal("0.0005"))
+        result = node.submitpackage([zero_fee_parent["hex"], sponsor_child["hex"]])
+        assert_equal(result["package_msg"], "success")
+        package_weight = zero_fee_parent["tx"].get_weight() + sponsor_child["tx"].get_weight()
+        package_fee = sponsor_child["fee"]
+        # sanity check: replacement > package chunk > tx_mid, by feerate
+        assert_greater_than(2 * cpfp_fee * package_weight, package_fee * replacement_weight)
+        assert_greater_than(package_fee * mid_weight, tx_mid["fee"] * package_weight)
+        assert_equal(diagram_points(), [
+            (0, 0),
+            (replacement_weight, 2 * cpfp_fee),
+            (replacement_weight + package_weight, 2 * cpfp_fee + package_fee),
+            (replacement_weight + package_weight + mid_weight, 2 * cpfp_fee + package_fee + tx_mid["fee"]),
+        ])
+        self.check_diagram_matches_clusters(node)
+
+        # Mining a block that confirms everything empties the diagram
+        self.generate(node, 1)
+        assert_equal(node.getrawmempool(), [])
+        assert_equal(diagram_points(), [(0, 0)])
+
     def run_test(self):
         node = self.nodes[0]
         self.wallet = MiniWallet(node)
         self.generate(self.wallet, 400)
 
         self.test_getmempoolcluster()
+
+        self.test_feerate_diagram()
 
         self.test_cluster_limit_rbf(DEFAULT_CLUSTER_LIMIT)
 
